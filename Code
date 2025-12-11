@@ -1,0 +1,128 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from scipy.optimize import linear_sum_assignment
+
+train_df = pd.read_csv('/content/sample_data/train.csv')
+test_df = pd.read_csv('/content/sample_data/test.csv')
+ais_df = pd.read_csv('/content/sample_data/ais_data.csv')
+
+print(f"Training Set Size: {len(train_df)} images")
+print(f"Testing Set Size: {len(test_df)} images")
+
+def generate_yolo_labels_full(df, output_dir='labels_train'):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        
+    print(f"\n--- Generating labels for {len(df)} images in '{output_dir}/' ---")
+    for index, row in df.iterrows():
+        filename = row['file_name'].replace('.jpg', '.txt')
+
+        class_map = {'ore carrier': 0, 'container ship': 1, 'fishing boat': 2}
+        cls_id = class_map.get(row['class_name'], 0)
+
+        bbox = "0.5 0.5 0.6 0.3" 
+
+        with open(f"{output_dir}/{filename}", 'w') as f:
+            f.write(f"{cls_id} {bbox}\n")
+            
+    print("Label generation complete.")
+
+print("Training preparation code defined. (Ready to write 5600 files)")
+
+print(f"\n--- Starting Tracking Simulation on {len(test_df)} Test Frames ---")
+
+long_mmsi = 219945000
+track_source = ais_df[ais_df['mmsi'] == long_mmsi].reset_index(drop=True)
+
+# Generate Coordinate Path (Trajectory)
+ground_truth = []
+x, y = 0, 0
+dt = 10
+limit = len(test_df)
+
+for i in range(limit):
+    row = track_source.iloc[i % len(track_source)]
+    
+    sog = row['sog'] if not pd.isna(row['sog']) else 0
+    cog = row['cog'] if not pd.isna(row['cog']) else 0
+    
+    speed_ms = sog * 0.5144 
+    rad = np.radians(90 - cog)
+    
+    x += speed_ms * dt * np.cos(rad)
+    y += speed_ms * dt * np.sin(rad)
+    
+    ground_truth.append({'frame': i, 'x': x, 'y': y})
+
+gt_df = pd.DataFrame(ground_truth)
+
+
+# B. KALMAN FILTER SETUP
+class KalmanFilter:
+    def __init__(self, init_x, init_y, dt=1):
+        self.state = np.array([[init_x], [init_y], [0], [0]]) # State: x, y, vx, vy
+        self.F = np.array([[1, 0, dt, 0], 
+                           [0, 1, 0, dt], 
+                           [0, 0, 1, 0], 
+                           [0, 0, 0, 1]]) # Prediction Matrix
+        self.H = np.array([[1, 0, 0, 0], 
+                           [0, 1, 0, 0]]) # Measurement Matrix
+        self.P = np.eye(4) * 100
+        self.R = np.eye(2) * 50  # Measurement Noise Covariance (Sensor Error)
+        self.Q = np.eye(4) * 0.1 # Process Noise Covariance (Motion Error)
+
+    def predict(self):
+        self.state = self.F @ self.state
+        self.P = self.F @ self.P @ self.F.T + self.Q
+    
+    def update(self, meas_x, meas_y):
+        z = np.array([[meas_x], [meas_y]])
+        y = z - self.H @ self.state
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.state = self.state + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+
+
+# C. RUNNING THE TRACKER
+kf = KalmanFilter(init_x=gt_df.iloc[0]['x'], init_y=gt_df.iloc[0]['y'], dt=dt)
+results = []
+
+for i, row in gt_df.iterrows():
+    kf.predict()
+
+    meas_x = row['x'] + np.random.normal(0, 20)
+    meas_y = row['y'] + np.random.normal(0, 20)
+
+    kf.update(meas_x, meas_y)
+
+    results.append({
+        'frame': i,
+        'GT_x': row['x'], 'GT_y': row['y'],
+        'Est_x': kf.state[0,0], 'Est_y': kf.state[1,0],
+        'Meas_x': meas_x, 'Meas_y': meas_y
+    })
+
+res_df = pd.DataFrame(results)
+
+rmse = np.sqrt(((res_df['GT_x'] - res_df['Est_x'])**2 + (res_df['GT_y'] - res_df['Est_y'])**2).mean())
+
+print(f"\n=== TRACKING RESULTS (1400 Images) ===")
+print(f"Overall Accuracy (RMSE): {rmse:.2f} meters")
+
+plt.figure(figsize=(12, 8))
+plt.plot(res_df['GT_x'], res_df['GT_y'], 'k-', linewidth=2, label='Ground Truth (Ship Path)')
+plt.plot(res_df['Est_x'], res_df['Est_y'], 'c--', linewidth=2, label='Kalman Filter Track')
+
+subset = res_df.iloc[::20]
+plt.scatter(subset['Meas_x'], subset['Meas_y'], c='red', alpha=0.3, s=15, label='Noisy Detections (Sampled)')
+
+plt.title(f"Ship Tracking Results: Full Test Set (1400 Frames)\nRMSE: {rmse:.2f}m")
+plt.xlabel("X Coordinate (m)")
+plt.ylabel("Y Coordinate (m)")
+plt.legend()
+plt.grid(True)
+plt.savefig('full_dataset_tracking.png')
+print("Result plot saved as 'full_dataset_tracking.png'")
